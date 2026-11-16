@@ -1,9 +1,9 @@
 """
 Debentures dos peers com look-through (abre cotas de fundos). Fonte: CVM, carteira mensal (CDA), publica.
-12 meses abertos + os meses recentes que a CVM ainda guarda como confidenciais (abre ~90 dias depois e republica o mes).
+12 meses com a carteira toda aberta. Os meses recentes (confidenciais; a CVM abre ~90 dias depois) ficam de fora.
 Uso:    python peers_debentures.py
 Saida:  peers_debentures.xlsx ao lado deste arquivo, uma linha por mes x fundo x debenture:
-        mes | fundo | cnpj | codigo | financeiro (R$) | perc_pl (% do PL);  aba "meses": % confidencial e sem codigo
+        mes | fundo | cnpj | codigo | financeiro (R$) | perc_pl (% do PL);  aba "meses": % sem codigo e peers sem carteira
         Linha sem codigo na CVM: codigo achado na SND (debentures.com.br) por CNPJ do emissor + vencimento.
 Dados:  dados_peers_debentures/ guarda um resumo pequeno por mes; so baixa de novo o mes que a CVM republicar.
 Requer: pandas, requests, openpyxl.
@@ -82,7 +82,7 @@ PEERS = {                       # se um CNPJ tambem estiver em NOSSOS_FUNDOS, va
     "Vinland Credito IQ": "61.735.868/0001-24",
 }
 
-MESES = 12                      # meses ABERTOS (nao confidenciais); os meses recentes, ainda confidenciais, vem junto
+MESES = 12                      # meses com a carteira aberta; os recentes (ainda confidenciais, ~90 dias) ficam de fora
 AQUI = Path(__file__).resolve().parent
 DADOS = AQUI / "dados_peers_debentures"
 OUT = AQUI / "peers_debentures.xlsx"
@@ -214,7 +214,7 @@ def main():
         if len(abertos) >= MESES or meses[0] == todos[0]:
             break
         meses = todos[-(len(meses) + MESES - len(abertos)):]
-    df = pd.concat([feitos[m][0] for m in meses], ignore_index=True)
+    df = pd.concat([feitos[m][0] for m in abertos[-MESES:]], ignore_index=True)
     df = df.assign(fundo=df.peer.str.replace(r"\D", "", regex=True).map(cnpj), cnpj=df.peer, financeiro=df.fin.round(2))
     df = df[["mes", "fundo", "cnpj", "codigo", "financeiro", "perc_pl"]].sort_values(
         ["mes", "fundo", "financeiro"], ascending=[False, True, False])
@@ -222,17 +222,14 @@ def main():
     resumo_mes = pd.DataFrame({
         "peers_com_carteira": g.fundo.nunique(),
         "financeiro_bi": g.financeiro.sum() / 1e9,
-        "pct_confidencial": [feitos[m.replace("-", "")][1] for m in g.groups],
         "pct_sem_codigo": df.financeiro.where(df.codigo.str.startswith("sem codigo"), 0).groupby(df.mes).sum() / g.financeiro.sum() * 100,
-        "peers_sem_carteira": [", ".join(feitos[m.replace("-", "")][2]) for m in g.groups],      # CVM nao tem a carteira do mes
-        "peers_sem_debenture_aberta": [", ".join(sorted(set(cnpj.values()) - set(feitos[m.replace("-", "")][2]) - set(x.fundo)))
-                                    for m, x in g]}).sort_index(ascending=False).round(2)          # cota do master confidencial ou master ainda sem carteira
+        "peers_sem_carteira": [", ".join(feitos[m.replace("-", "")][2]) for m in g.groups]}).sort_index(ascending=False).round(2)
     with pd.ExcelWriter(OUT) as w:
         df.to_excel(w, sheet_name="debentures", index=False)
         resumo_mes.to_excel(w, sheet_name="meses")
     print(resumo_mes.drop(columns="peers_sem_carteira").to_string())
-    print(f"salvo {OUT.name}: {len(df):,} linhas, {df.fundo.nunique()} fundos, {len(meses)} meses "
-          f"({len(abertos)} abertos + {len(meses) - len(abertos)} ainda confidenciais)")
+    print(f"salvo {OUT.name}: {len(df):,} linhas, {df.fundo.nunique()} fundos, {df.mes.nunique()} meses abertos "
+          f"({df.mes.min()} a {df.mes.max()}); fora, ainda confidenciais: {', '.join(m for m in meses if m not in abertos)}")
 
 
 if __name__ == "__main__":
