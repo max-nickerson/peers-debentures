@@ -1,14 +1,17 @@
 """
-Debentures dos peers com look-through (abre cotas de fundos), ultimos 12 meses. Fonte: CVM, carteira mensal (CDA), publica.
+Debentures dos peers com look-through (abre cotas de fundos). Fonte: CVM, carteira mensal (CDA), publica.
+12 meses abertos + os meses recentes que a CVM ainda guarda como confidenciais (abre ~90 dias depois e republica o mes).
 Uso:    python peers_debentures.py
 Saida:  peers_debentures.xlsx ao lado deste arquivo, uma linha por mes x fundo x debenture:
-        mes | fundo | cnpj | codigo | financeiro (R$) | perc_pl (% do PL)
+        mes | fundo | cnpj | codigo | financeiro (R$) | perc_pl (% do PL);  aba "meses": % confidencial e sem codigo
+        Linha sem codigo na CVM: codigo achado na SND (debentures.com.br) por CNPJ do emissor + vencimento.
 Dados:  dados_peers_debentures/ guarda um resumo pequeno por mes; so baixa de novo o mes que a CVM republicar.
 Requer: pandas, requests, openpyxl.
 """
 import io
 import zipfile
 from concurrent.futures import ProcessPoolExecutor
+from datetime import date
 from pathlib import Path
 import re
 
@@ -79,11 +82,13 @@ PEERS = {                       # se um CNPJ tambem estiver em NOSSOS_FUNDOS, va
     "Vinland Credito IQ": "61.735.868/0001-24",
 }
 
-MESES = 12                      # quantos meses de carteira (os mais recentes publicados pela CVM)
+MESES = 12                      # meses ABERTOS (nao confidenciais); os meses recentes, ainda confidenciais, vem junto
 AQUI = Path(__file__).resolve().parent
 DADOS = AQUI / "dados_peers_debentures"
 OUT = AQUI / "peers_debentures.xlsx"
 URL = "https://dados.cvm.gov.br/dados/FI/DOC/CDA/DADOS/"
+SND = "https://www.debentures.com.br/exploreosnd/consultaadados/emissoesdedebentures/caracteristicas_e.asp?tip_deb=publicas&ativo=&op_exc="
+VERSAO = 2                      # formato do resumo mensal (mudou = refaz os resumos)
 REN = {"CNPJ_FUNDO": "CNPJ_FUNDO_CLASSE", "CNPJ_FUNDO_COTA": "CNPJ_FUNDO_CLASSE_COTA"}     # nomes antigos da CVM
 
 
@@ -94,7 +99,7 @@ def le(z, nome, cols):
 
 def resumo(ym, versao):
     """Baixa o zip do mes e guarda so o necessario de TODOS os fundos: PL, cotas de fundos e debentures."""
-    f = DADOS / f"{ym}_{versao}.pkl"
+    f = DADOS / f"{ym}_{versao}_v{VERSAO}.pkl"
     if f.exists():
         return f
     r = requests.get(f"{URL}cda_fi_{ym}.zip", timeout=900)
@@ -106,24 +111,72 @@ def resumo(ym, versao):
     pl = pl.set_index("CNPJ_FUNDO_CLASSE").VL_PATRIM_LIQ.astype(float)
     cota = junta(["_BLC_2_"], {"CNPJ_FUNDO_CLASSE", "CNPJ_FUNDO_CLASSE_COTA", "VL_MERC_POS_FINAL"}).dropna()
     cota = cota.rename(columns={"CNPJ_FUNDO_CLASSE": "pai", "CNPJ_FUNDO_CLASSE_COTA": "filho", "VL_MERC_POS_FINAL": "v"})
-    d = junta(["_BLC_4_", "_BLC_6_", "_BLC_8_", "CONFID"],
-              {"CNPJ_FUNDO_CLASSE", "TP_APLIC", "VL_MERC_POS_FINAL", "CD_ATIVO", "DS_ATIVO", "EMISSOR", "DT_VENC"})
+    d = junta(["_BLC_4_", "_BLC_6_", "_BLC_8_", "CONFID"], {"CNPJ_FUNDO_CLASSE", "TP_APLIC", "VL_MERC_POS_FINAL", "CD_ATIVO",
+              "DS_ATIVO", "EMISSOR", "CPF_CNPJ_EMISSOR", "DT_VENC", "PR_CUPOM_POSFX"})
     d = d[d.TP_APLIC.fillna("").str.startswith("Deb")]                  # Debentures / Debentures conversiveis (nao compromissada)
     t = lambda c: d[c].fillna("").str.strip() if c in d else pd.Series("", index=d.index)
-    sem = (t("EMISSOR").where(t("EMISSOR") != "", t("DS_ATIVO")) + " " + t("DT_VENC")).str.strip()
-    d["codigo"] = t("CD_ATIVO").where(t("CD_ATIVO") != "", "sem codigo: " + sem).where(~d.conf, "(confidencial)")
+    x = t("DS_ATIVO").str.extract(r"(\d{2}/\d{2}/\d{4}) / (\d{14})")    # BLC_8: "DEBENTURES / venc / CNPJ do emissor"
+    d["codigo"] = t("CD_ATIVO").str.upper().where(~d.conf, "(confidencial)")
+    sem = d.codigo.eq("")                                                # sem codigo: guarda emissor, vencimento e cupom p/ achar na SND
+    d["cnpj_em"] = t("CPF_CNPJ_EMISSOR").str.replace(r"\D", "", regex=True).where(sem, "")
+    d["cnpj_em"] = d.cnpj_em.where(d.cnpj_em != "", x[1].fillna("").where(sem, ""))
+    d["venc"] = pd.to_datetime(t("DT_VENC"), errors="coerce").fillna(pd.to_datetime(x[0], format="%d/%m/%Y", errors="coerce"))
+    d["venc"] = d.venc.dt.strftime("%Y-%m-%d").fillna("").where(sem, "")
+    d["cupom"] = pd.to_numeric(t("PR_CUPOM_POSFX").str.replace(",", "."), errors="coerce").round(4).fillna(-1).where(sem, -1)
+    d["emissor"] = t("EMISSOR").where(t("EMISSOR") != "", t("DS_ATIVO")).where(sem, "")
     d = d.rename(columns={"CNPJ_FUNDO_CLASSE": "fundo", "VL_MERC_POS_FINAL": "v"})
-    for x in (cota, d):
-        x["v"] = pd.to_numeric(x.v, errors="coerce").fillna(0)
-    d = d.groupby(["fundo", "codigo"], as_index=False).v.sum()
-    for velho in DADOS.glob(f"{ym}_*.pkl"):                              # CVM republicou: troca o resumo do mes
+    for y in (cota, d):
+        y["v"] = pd.to_numeric(y.v, errors="coerce").fillna(0)
+    d = d.groupby(["fundo", "codigo", "cnpj_em", "venc", "cupom", "emissor"], as_index=False).v.sum()
+    for velho in DADOS.glob(f"{ym}_*.pkl"):                              # CVM republicou (ex.: abriu as confidenciais): troca o resumo
         velho.unlink()
     pd.to_pickle((pl, cota, d), f)
     return f
 
 
+def snd():
+    """Cadastro de todas as debentures da SND (ativas e vencidas): codigo, CNPJ do emissor, vencimento, taxa. 1x por dia."""
+    f = DADOS / f"snd_{date.today()}.pkl"
+    if f.exists():
+        return pd.read_pickle(f)
+    partes = []
+    try:
+        for exc in ("False", "True"):
+            t = requests.get(SND + exc, headers={"User-Agent": "Mozilla/5.0"}, timeout=300).content.decode("latin1").splitlines()
+            i = next(j for j, l in enumerate(t) if l.startswith("Codigo do Ativo"))
+            partes.append(pd.read_csv(io.StringIO("\n".join(t[i:])), sep="\t", dtype=str, quoting=3))
+    except (requests.RequestException, StopIteration):
+        print("aviso: SND (debentures.com.br) fora do ar; linhas sem codigo ficam 'sem codigo: ...'")
+        return pd.DataFrame(columns=["codigo", "cnpj_em", "venc", "juros"])
+    a = pd.concat(partes, ignore_index=True)
+    a.columns = a.columns.str.strip()
+    a = a.apply(lambda s: s.str.strip())
+    s = pd.concat([pd.DataFrame({"codigo": a["Codigo do Ativo"], "cnpj_em": a.CNPJ.str.replace(r"\D", "", regex=True),
+                                 "venc": pd.to_datetime(a[c], format="%d/%m/%Y", errors="coerce").dt.strftime("%Y-%m-%d"),
+                                 "juros": pd.to_numeric(a["Juros Criterio Novo - Taxa"].str.replace(",", "."), errors="coerce")})
+                   for c in ("Data de Vencimento", "Data de Saida / Novo Vencimento")]).dropna(subset=["venc"]).drop_duplicates()
+    for velho in DADOS.glob("snd_*.pkl"):
+        velho.unlink()
+    s.to_pickle(f)
+    return s
+
+
+def nomeia(deb, s):
+    """Linha sem codigo -> codigo da SND pelo CNPJ do emissor + vencimento (empate: mesmo cupom). Varias series: 'A/B'."""
+    sem = deb.codigo.eq("")
+    m = deb.loc[sem, ["cnpj_em", "venc", "cupom"]].drop_duplicates().merge(s, on=["cnpj_em", "venc"])
+    m["bate"] = (m.juros - m.cupom).abs().lt(0.01)
+    m = m[m.bate | ~m.groupby(["cnpj_em", "venc", "cupom"]).bate.transform("any")]
+    nome = m.groupby(["cnpj_em", "venc", "cupom"], as_index=False).codigo.agg(lambda c: "/".join(sorted(set(c))))
+    achou = deb.loc[sem, ["cnpj_em", "venc", "cupom"]].merge(nome, how="left").codigo.values
+    achou = pd.Series(achou, index=deb.index[sem])
+    deb.loc[sem, "codigo"] = achou.fillna("sem codigo: " + (deb.emissor + " " + deb.venc).str.strip()[sem])
+    return deb.groupby(["fundo", "codigo"], as_index=False).v.sum()
+
+
 def explode(pl, cota, deb, peers):
-    """f = fracao de cada veiculo que pertence ao peer (1 no proprio peer; cota/PL do fundo investido nos seguintes)."""
+    """f = fracao de cada veiculo que pertence ao peer (1 no proprio peer; cota/PL do fundo investido nos seguintes).
+    Cotas de FIDC/FII/FIAGRO nao abrem (esses fundos nao mandam CDA) - e nao sao debenture."""
     front = pd.DataFrame({"peer": peers, "veic": peers, "f": 1.0})
     achou = []
     for _ in range(10):                                                  # 10 niveis de FIC dentro de FIC e mais que suficiente
@@ -134,6 +187,7 @@ def explode(pl, cota, deb, peers):
         nx["f"] = nx.f * nx.v / nx.filho.map(pl)                          # fundo investido sem carteira na CVM: some (NaN)
         front = nx[nx.f > 0].groupby(["peer", "filho"], as_index=False).f.sum().rename(columns={"filho": "veic"})
     x = pd.concat(achou, ignore_index=True).groupby(["peer", "codigo"], as_index=False).fin.sum()
+    x = x[x.fin.round(2) != 0]
     return x.assign(perc_pl=x.fin / x.peer.map(pl) * 100)
 
 
@@ -141,29 +195,44 @@ def main():
     DADOS.mkdir(exist_ok=True)
     html = requests.get(URL, timeout=60).text
     pub = dict(re.findall(r"cda_fi_(\d{6})\.zip</a>\s+(\d{2}-\w{3}-\d{4} \d{2}:\d{2})", html))
-    meses = sorted(pub)[-MESES:]
-    print(f"CVM: meses {meses[0]} a {meses[-1]}; baixando o que falta (cada mes ~25 MB, so na 1a vez ou se republicado)...")
-    versao = {m: re.sub(r"\W", "", pub[m]) for m in meses}
-    with ProcessPoolExecutor(4) as ex:
-        arqs = dict(zip(meses, ex.map(resumo, meses, [versao[m] for m in meses])))
+    todos = sorted(pub)
+    s = snd()
     cnpj = {re.sub(r"\D", "", c): n for n, c in PEERS.items()}
     fmt = lambda c: f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}"
-    linhas = []
-    for m, f in arqs.items():
-        pl, cota, deb = pd.read_pickle(f)
-        peers = [fmt(c) for c in cnpj if fmt(c) in pl.index]
-        faltam = [cnpj[re.sub(r"\D", "", c)] for c in map(fmt, cnpj) if c not in pl.index]
-        print(f"  {m}: {len(peers)} peers com carteira" + (f"; sem carteira: {', '.join(faltam)}" if faltam else ""))
-        linhas.append(explode(pl, cota, deb, peers).assign(mes=f"{m[:4]}-{m[4:]}"))
-    df = pd.concat(linhas, ignore_index=True)
+    feitos, meses = {}, todos[-MESES:]
+    print("CVM: baixando o que falta (cada mes ~25 MB, so na 1a vez ou quando a CVM republica)...")
+    while True:                     # volta no tempo ate ter MESES meses abertos (a CVM abre as confidenciais ~90 dias depois)
+        falta = [m for m in meses if m not in feitos]
+        with ProcessPoolExecutor(4) as ex:
+            for m, f in zip(falta, ex.map(resumo, falta, [re.sub(r"\W", "", pub[m]) for m in falta])):
+                pl, cota, deb = pd.read_pickle(f)
+                peers = [fmt(c) for c in cnpj if fmt(c) in pl.index]
+                x = explode(pl, cota, nomeia(deb, s), peers).assign(mes=f"{m[:4]}-{m[4:]}")
+                conf = x.fin[x.codigo.eq("(confidencial)")].sum() / x.fin.sum() * 100
+                feitos[m] = x, conf, [n for c, n in cnpj.items() if fmt(c) not in pl.index]
+        abertos = [m for m in meses if feitos[m][1] < 20]
+        if len(abertos) >= MESES or meses[0] == todos[0]:
+            break
+        meses = todos[-(len(meses) + MESES - len(abertos)):]
+    df = pd.concat([feitos[m][0] for m in meses], ignore_index=True)
     df = df.assign(fundo=df.peer.str.replace(r"\D", "", regex=True).map(cnpj), cnpj=df.peer, financeiro=df.fin.round(2))
     df = df[["mes", "fundo", "cnpj", "codigo", "financeiro", "perc_pl"]].sort_values(
         ["mes", "fundo", "financeiro"], ascending=[False, True, False])
-    df.to_excel(OUT, sheet_name="debentures", index=False)
-    ult = df[df.mes == df.mes.max()]
-    print(f"salvo {OUT.name}: {len(df):,} linhas, {df.fundo.nunique()} fundos, {df.mes.nunique()} meses; "
-          f"ultimo mes {ult.mes.iat[0]}: R$ {ult.financeiro.sum() / 1e9:,.2f} bi em debentures")
-    print("obs.: meses recentes tem parte confidencial (a CVM abre em ate 90 dias); linhas sem codigo vem como 'sem codigo: emissor vencimento'")
+    g = df.groupby("mes")
+    resumo_mes = pd.DataFrame({
+        "peers_com_carteira": g.fundo.nunique(),
+        "financeiro_bi": g.financeiro.sum() / 1e9,
+        "pct_confidencial": [feitos[m.replace("-", "")][1] for m in g.groups],
+        "pct_sem_codigo": df.financeiro.where(df.codigo.str.startswith("sem codigo"), 0).groupby(df.mes).sum() / g.financeiro.sum() * 100,
+        "peers_sem_carteira": [", ".join(feitos[m.replace("-", "")][2]) for m in g.groups],      # CVM nao tem a carteira do mes
+        "peers_sem_debenture_aberta": [", ".join(sorted(set(cnpj.values()) - set(feitos[m.replace("-", "")][2]) - set(x.fundo)))
+                                    for m, x in g]}).sort_index(ascending=False).round(2)          # cota do master confidencial ou master ainda sem carteira
+    with pd.ExcelWriter(OUT) as w:
+        df.to_excel(w, sheet_name="debentures", index=False)
+        resumo_mes.to_excel(w, sheet_name="meses")
+    print(resumo_mes.drop(columns="peers_sem_carteira").to_string())
+    print(f"salvo {OUT.name}: {len(df):,} linhas, {df.fundo.nunique()} fundos, {len(meses)} meses "
+          f"({len(abertos)} abertos + {len(meses) - len(abertos)} ainda confidenciais)")
 
 
 if __name__ == "__main__":
